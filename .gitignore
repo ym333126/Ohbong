@@ -1,0 +1,31 @@
+# environment
+.env
+.venv/
+venv/
+
+# python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# data files
+data/*.csv
+data/*.xlsx
+
+# model artifacts and outputs
+models/*.pt
+models/*.pth
+models/*.joblib
+models/*.pkl
+models/*.json
+models/*.csv
+models/*.png
+
+# logs
+*.log
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
