@@ -21,6 +21,16 @@ models/*.pkl
 models/*.json
 models/*.csv
 models/*.png
+models/**/*.pt
+models/**/*.pth
+models/**/*.joblib
+models/**/*.pkl
+models/**/*.json
+models/**/*.csv
+models/**/*.png
+
+# incoming team packages
+incoming_team_files/
 
 # logs
 *.log
