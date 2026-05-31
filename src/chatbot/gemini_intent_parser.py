@@ -48,6 +48,7 @@ DEFAULT_PLAN: dict[str, Any] = {
     "need_table": False,
     "scenario": {
         "rainfall_multiplier": 1.0,
+        "rainfall_sum_30d": None,
         "spi3_delta": 0.0,
         "spi6_delta": 0.0,
         "temperature_delta": 0.0,
@@ -135,7 +136,10 @@ def normalize_intent_plan(
     plan["target_reservoirs"] = reservoirs or base["target_reservoirs"]
 
     for key in ("target_date", "target_month"):
-        plan[key] = raw.get(key) if raw.get(key) is not None else base.get(key)
+        value = raw.get(key) if raw.get(key) is not None else base.get(key)
+        if isinstance(value, str) and value.strip().lower() in {"", "none", "null", "nan", "nat", "-"}:
+            value = None
+        plan[key] = value
 
     plan["forecast_horizon"] = int(_coerce_float(raw.get("forecast_horizon"), base["forecast_horizon"]))
     plan["target_rate"] = _coerce_float(raw.get("target_rate"), base["target_rate"])
@@ -157,6 +161,11 @@ def normalize_intent_plan(
     plan["scenario"] = {
         "rainfall_multiplier": _coerce_float(
             scenario.get("rainfall_multiplier"), base["scenario"]["rainfall_multiplier"]
+        ),
+        "rainfall_sum_30d": (
+            None
+            if scenario.get("rainfall_sum_30d") is None
+            else _coerce_float(scenario.get("rainfall_sum_30d"), 0.0)
         ),
         "spi3_delta": _coerce_float(scenario.get("spi3_delta"), base["scenario"]["spi3_delta"]),
         "spi6_delta": _coerce_float(scenario.get("spi6_delta"), base["scenario"]["spi6_delta"]),
@@ -200,6 +209,7 @@ def parse_intent_with_gemini(
   "need_table": false,
   "scenario": {{
     "rainfall_multiplier": 1.0,
+    "rainfall_sum_30d": null,
     "spi3_delta": 0.0,
     "spi6_delta": 0.0,
     "temperature_delta": 0.0
@@ -208,15 +218,18 @@ def parse_intent_with_gemini(
 
 분류 규칙:
 - 관측 저수율, 현재, 오늘, 특정 날짜의 저수율을 묻는 질문은 observation_lookup.
-- 예측, 다음 달, 향후, 앞으로, 6월 예측은 prediction.
+- 예측, 다음 달, 향후, 앞으로, 6월 예측, "6월 저수율이 어떨지"는 prediction.
 - 어디서, 얼마 가져와, 운송, 최적화, 공급은 optimization.
-- 예측과 최적화를 동시에 요청하면 pipeline.
+- 예측/시나리오/강수 조건과 최적화 필요 여부를 동시에 요청하면 pipeline. 예: "6월 예상 강수량이 350~450mm일 때 저수율은 어떻고 운송최적화가 필요한지"는 pipeline.
 - 여러 저수지 비교, 목록, 표, 22개 저수지 결과는 comparison_or_table.
 - "최종 후보 5개", "5개만", "상위 3개"처럼 개수를 말하면 top_k에 숫자를 넣고 need_table=true.
-- "강릉시 저수지", "강릉 소재", "강릉에 있는", "강릉시로만"은 allowed_region="강릉시".
-- "타지역 포함", "섞어서", "전체 후보", "강릉시가 아닌 곳도"는 allowed_region=null.
+- "강릉시 저수지", "강릉 소재", "강릉에 있는", "강릉시로만"처럼 공급 후보 지역을 제한하는 표현은 allowed_region="강릉시".
+- "강릉시 예상 강수량", "강릉시에 장마", "강릉시 강수"처럼 날씨 위치를 말하는 표현은 공급 후보 지역 제한이 아니므로 allowed_region=null.
+- "강릉시 이외", "강릉시 외", "강릉시 제외", "강릉 이외", "강릉 외", "강릉 제외", "강릉시가 아닌", "타지역", "타 지역"은 allowed_region=null로 둔다. 이 경우 실행 로직이 강릉시 제외 후보로 해석한다.
+- "타지역 포함", "섞어서", "강릉시 이외 지역과 섞어서", "전체 후보"는 allowed_region=null로 둔다. 이 경우 실행 로직이 강릉시와 타지역을 모두 포함한 후보로 해석한다.
 - "비 안", "무강수", "강수 없음"은 rainfall_multiplier=0.0.
 - "강수 절반", "비 절반"은 rainfall_multiplier=0.5.
+- "강수량 350~400mm", "비 350mm", "장마 400mm"처럼 총 강수량을 말하면 rainfall_sum_30d에 mm 단위 숫자를 넣어라. 범위면 평균값을 넣어라.
 - SPI3/SPI6/기온/목표 저수율/최대 거리 숫자는 해당 필드에 넣어라.
 - target_reservoirs는 가능한 한 알려진 저수지명만 사용하라. 없으면 ["오봉"].
 - "오늘" 또는 "현재" 날짜는 최신 데이터 날짜를 target_date로 둔다.

@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import json
 import sys
 from dataclasses import dataclass
@@ -21,21 +23,31 @@ from src.utils.risk_policy import classify_reservoir_stage  # noqa: E402
 
 
 DEFAULT_MODEL_DIR = PROJECT_ROOT / "models" / "transformer_v4_seq2seq"
+
 DATE_COL = "날짜"
 RESERVOIR_COL = "저수지명"
 CITY_COL = "시군"
 TARGET_COL = "저수율_5일EMA"
+OBSERVED_RATE_COL = "저수율"
+RAIN_COL = "강수량"
+TEMP_COL = "평균기온(℃)"
+TEMP_ROLLING_COL = "기온_7일평균"
+RAIN_3D_COL = "강수량_3일누적"
+RAIN_7D_COL = "강수량_7일누적"
+CAPACITY_COL = "유효저수량(천m3)"
+LAT_COL = "위도"
+LON_COL = "경도"
 
 FEATURE_COL_FALLBACK = [
-    "저수율_5일EMA",
-    "기온_7일평균",
-    "강수량_3일누적",
-    "강수량_7일누적",
+    TARGET_COL,
+    TEMP_ROLLING_COL,
+    RAIN_3D_COL,
+    RAIN_7D_COL,
     "SPI3",
     "SPI6",
-    "유효저수량(천m3)",
-    "위도",
-    "경도",
+    CAPACITY_COL,
+    LAT_COL,
+    LON_COL,
     "delta_1d_lag1",
     "delta_7d_mean",
     "저수율_rolling_std14",
@@ -90,18 +102,135 @@ def load_seq2seq_artifacts(
     model.load_state_dict(state_dict)
     model.eval()
 
-    return Seq2SeqArtifacts(model=model, scaler=scaler, config=config, residual_stats=residual_stats, device=selected_device)
+    return Seq2SeqArtifacts(
+        model=model,
+        scaler=scaler,
+        config=config,
+        residual_stats=residual_stats,
+        device=selected_device,
+    )
 
 
 def _safe_numeric(series: pd.Series, default: float = 0.0) -> pd.Series:
     return pd.to_numeric(series, errors="coerce").fillna(default)
 
 
+def _scenario_value(scenario: Optional[dict], key: str, default: float) -> float:
+    if not scenario:
+        return default
+    value = scenario.get(key, default)
+    if value is None:
+        return default
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def scenario_has_effect(scenario: Optional[dict]) -> bool:
+    if not scenario:
+        return False
+    return (
+        _scenario_value(scenario, "rainfall_multiplier", 1.0) != 1.0
+        or (scenario.get("rainfall_sum_30d") is not None if scenario else False)
+        or _scenario_value(scenario, "temperature_delta", 0.0) != 0.0
+        or _scenario_value(scenario, "spi3_delta", 0.0) != 0.0
+        or _scenario_value(scenario, "spi6_delta", 0.0) != 0.0
+    )
+
+
+def normalized_scenario(scenario: Optional[dict]) -> dict[str, float]:
+    return {
+        "rainfall_multiplier": _scenario_value(scenario, "rainfall_multiplier", 1.0),
+        "rainfall_sum_30d": np.nan if not scenario or scenario.get("rainfall_sum_30d") is None else _scenario_value(scenario, "rainfall_sum_30d", np.nan),
+        "temperature_delta": _scenario_value(scenario, "temperature_delta", 0.0),
+        "spi3_delta": _scenario_value(scenario, "spi3_delta", 0.0),
+        "spi6_delta": _scenario_value(scenario, "spi6_delta", 0.0),
+    }
+
+
+def apply_scenario_to_recent_history(
+    prepared: pd.DataFrame,
+    scenario: Optional[dict],
+    as_of_date: Optional[str | pd.Timestamp],
+    apply_days: int = 60,
+) -> pd.DataFrame:
+    """Apply scenario values to the model input window.
+
+    This scenario method does not inject future 30-day weather features into the
+    model. To reuse the existing trained Seq2Seq model without retraining, it
+    adjusts rainfall, temperature, and SPI values in the recent input window and
+    then recalculates derived rolling features before prediction.
+    """
+    if not scenario_has_effect(scenario):
+        return prepared
+
+    adjusted = prepared.copy()
+    values = normalized_scenario(scenario)
+    basis_date = pd.Timestamp(as_of_date) if as_of_date is not None else adjusted[DATE_COL].max()
+    window_start = basis_date - pd.Timedelta(days=apply_days - 1)
+    window_mask = (adjusted[DATE_COL] >= window_start) & (adjusted[DATE_COL] <= basis_date)
+
+    if RAIN_COL in adjusted.columns:
+        adjusted[RAIN_COL] = pd.to_numeric(adjusted[RAIN_COL], errors="coerce")
+        if np.isnan(values["rainfall_sum_30d"]):
+            adjusted.loc[window_mask, RAIN_COL] = adjusted.loc[window_mask, RAIN_COL] * values["rainfall_multiplier"]
+        else:
+            for _, index in adjusted.loc[window_mask].groupby(RESERVOIR_COL).groups.items():
+                recent_sum = float(adjusted.loc[index, RAIN_COL].tail(30).fillna(0.0).sum())
+                multiplier = values["rainfall_sum_30d"] / recent_sum if recent_sum > 0 else 1.0
+                adjusted.loc[index, RAIN_COL] = adjusted.loc[index, RAIN_COL] * multiplier
+    if TEMP_COL in adjusted.columns:
+        adjusted.loc[window_mask, TEMP_COL] = (
+            pd.to_numeric(adjusted.loc[window_mask, TEMP_COL], errors="coerce") + values["temperature_delta"]
+        )
+    if "SPI3" in adjusted.columns:
+        adjusted.loc[window_mask, "SPI3"] = pd.to_numeric(adjusted.loc[window_mask, "SPI3"], errors="coerce") + values["spi3_delta"]
+    if "SPI6" in adjusted.columns:
+        adjusted.loc[window_mask, "SPI6"] = pd.to_numeric(adjusted.loc[window_mask, "SPI6"], errors="coerce") + values["spi6_delta"]
+
+    for key, value in values.items():
+        adjusted[f"scenario_{key}"] = value
+    return adjusted
+
+
+def _recalculate_rolling_features(prepared: pd.DataFrame) -> pd.DataFrame:
+    prepared = prepared.sort_values([RESERVOIR_COL, DATE_COL]).reset_index(drop=True)
+    group = prepared.groupby(RESERVOIR_COL, sort=False)
+
+    if TARGET_COL not in prepared.columns and OBSERVED_RATE_COL in prepared.columns:
+        prepared[TARGET_COL] = group[OBSERVED_RATE_COL].transform(
+            lambda s: _safe_numeric(s).ewm(span=5, adjust=False).mean()
+        )
+    if TEMP_COL in prepared.columns:
+        prepared[TEMP_ROLLING_COL] = group[TEMP_COL].transform(
+            lambda s: _safe_numeric(s).rolling(7, min_periods=1).mean()
+        )
+    if RAIN_COL in prepared.columns:
+        prepared[RAIN_3D_COL] = group[RAIN_COL].transform(
+            lambda s: _safe_numeric(s).rolling(3, min_periods=1).sum()
+        )
+        prepared[RAIN_7D_COL] = group[RAIN_COL].transform(
+            lambda s: _safe_numeric(s).rolling(7, min_periods=1).sum()
+        )
+
+    rate_group = prepared.groupby(RESERVOIR_COL, sort=False)[TARGET_COL]
+    prepared["delta_1d_lag1"] = rate_group.diff().groupby(prepared[RESERVOIR_COL]).shift(1).fillna(0.0)
+    prepared["delta_7d_mean"] = group[TARGET_COL].transform(
+        lambda s: _safe_numeric(s).diff().rolling(7, min_periods=1).mean()
+    ).fillna(0.0)
+    prepared["저수율_rolling_std14"] = group[TARGET_COL].transform(
+        lambda s: _safe_numeric(s).rolling(14, min_periods=2).std()
+    ).fillna(0.0)
+    return prepared
+
+
 def prepare_seq2seq_dataframe(
     df: pd.DataFrame,
     as_of_date: Optional[str | pd.Timestamp] = None,
+    scenario: Optional[dict] = None,
 ) -> pd.DataFrame:
-    required = [DATE_COL, RESERVOIR_COL, "저수율", "강수량"]
+    required = [DATE_COL, RESERVOIR_COL, OBSERVED_RATE_COL, RAIN_COL]
     missing = [column for column in required if column not in df.columns]
     if missing:
         raise ValueError(f"seq2seq 예측에 필요한 컬럼이 없습니다: {missing}")
@@ -115,21 +244,22 @@ def prepare_seq2seq_dataframe(
         prepared = prepared[prepared[DATE_COL] <= pd.Timestamp(as_of_date)].copy()
 
     prepared = prepared.sort_values([RESERVOIR_COL, DATE_COL]).reset_index(drop=True)
-    group = prepared.groupby(RESERVOIR_COL, sort=False)
+    prepared = apply_scenario_to_recent_history(prepared, scenario=scenario, as_of_date=as_of_date)
 
+    group = prepared.groupby(RESERVOIR_COL, sort=False)
     numeric_base_cols = [
-        "저수율",
-        "저수율_5일EMA",
-        "평균기온(℃)",
-        "기온_7일평균",
-        "강수량",
-        "강수량_3일누적",
-        "강수량_7일누적",
+        OBSERVED_RATE_COL,
+        TARGET_COL,
+        TEMP_COL,
+        TEMP_ROLLING_COL,
+        RAIN_COL,
+        RAIN_3D_COL,
+        RAIN_7D_COL,
         "SPI3",
         "SPI6",
-        "유효저수량(천m3)",
-        "위도",
-        "경도",
+        CAPACITY_COL,
+        LAT_COL,
+        LON_COL,
     ]
     for column in numeric_base_cols:
         if column in prepared.columns:
@@ -138,19 +268,7 @@ def prepare_seq2seq_dataframe(
             median = prepared[column].median()
             prepared[column] = prepared[column].fillna(0.0 if pd.isna(median) else median)
 
-    if TARGET_COL not in prepared.columns:
-        prepared[TARGET_COL] = group["저수율"].transform(lambda s: _safe_numeric(s).ewm(span=5, adjust=False).mean())
-    if "기온_7일평균" not in prepared.columns and "평균기온(℃)" in prepared.columns:
-        prepared["기온_7일평균"] = group["평균기온(℃)"].transform(lambda s: _safe_numeric(s).rolling(7, min_periods=1).mean())
-    if "강수량_3일누적" not in prepared.columns:
-        prepared["강수량_3일누적"] = group["강수량"].transform(lambda s: _safe_numeric(s).rolling(3, min_periods=1).sum())
-    if "강수량_7일누적" not in prepared.columns:
-        prepared["강수량_7일누적"] = group["강수량"].transform(lambda s: _safe_numeric(s).rolling(7, min_periods=1).sum())
-
-    rate_group = prepared.groupby(RESERVOIR_COL, sort=False)[TARGET_COL]
-    prepared["delta_1d_lag1"] = rate_group.diff().groupby(prepared[RESERVOIR_COL]).shift(1).fillna(0.0)
-    prepared["delta_7d_mean"] = group[TARGET_COL].transform(lambda s: _safe_numeric(s).diff().rolling(7, min_periods=1).mean()).fillna(0.0)
-    prepared["저수율_rolling_std14"] = group[TARGET_COL].transform(lambda s: _safe_numeric(s).rolling(14, min_periods=2).std()).fillna(0.0)
+    prepared = _recalculate_rolling_features(prepared)
 
     month = prepared[DATE_COL].dt.month
     day_of_year = prepared[DATE_COL].dt.dayofyear
@@ -202,13 +320,15 @@ def predict_seq2seq_forecasts(
     as_of_date: Optional[str | pd.Timestamp] = None,
     reservoir_names: Optional[Iterable[str]] = None,
     model_dir: Optional[Path | str] = None,
+    scenario: Optional[dict] = None,
 ) -> pd.DataFrame:
     artifacts = artifacts or load_seq2seq_artifacts(model_dir=model_dir)
     config = artifacts.config
     seq_len = int(config.get("seq_len", 60))
     pred_len = int(config.get("pred_len", 30))
+    scenario_values = normalized_scenario(scenario)
 
-    df = prepare_seq2seq_dataframe(master_df, as_of_date=as_of_date)
+    df = prepare_seq2seq_dataframe(master_df, as_of_date=as_of_date, scenario=scenario)
     basis_date = pd.Timestamp(as_of_date) if as_of_date is not None else df[DATE_COL].max()
     feature_cols = resolve_feature_columns(config, df)
     selected = list(reservoir_names) if reservoir_names is not None else sorted(df[RESERVOIR_COL].dropna().unique())
@@ -225,7 +345,11 @@ def predict_seq2seq_forecasts(
             values = window[feature_cols].astype(float).to_numpy(dtype=np.float32)
             scaled = artifacts.scaler.transform(values).astype(np.float32)
             x_tensor = torch.as_tensor(scaled, dtype=torch.float32, device=artifacts.device).unsqueeze(0)
-            reservoir_id = torch.tensor([_get_reservoir_id(config, reservoir_name)], dtype=torch.long, device=artifacts.device)
+            reservoir_id = torch.tensor(
+                [_get_reservoir_id(config, reservoir_name)],
+                dtype=torch.long,
+                device=artifacts.device,
+            )
             prediction = artifacts.model(x_tensor, reservoir_id).detach().cpu().numpy().reshape(-1)
             prediction = np.clip(prediction, 0.0, 100.0)
 
@@ -255,6 +379,11 @@ def predict_seq2seq_forecasts(
                         "risk_code": stage["stage_code"],
                         "risk_label": stage["stage_label"],
                         "model_name": config.get("model_name", "transformer_v4_seq2seq"),
+                        "scenario_rainfall_multiplier": scenario_values["rainfall_multiplier"],
+                        "scenario_rainfall_sum_30d": scenario_values["rainfall_sum_30d"],
+                        "scenario_temperature_delta": scenario_values["temperature_delta"],
+                        "scenario_spi3_delta": scenario_values["spi3_delta"],
+                        "scenario_spi6_delta": scenario_values["spi6_delta"],
                     }
                 )
 
@@ -262,38 +391,6 @@ def predict_seq2seq_forecasts(
 
 
 def summarize_min_rates(forecast_df: pd.DataFrame) -> pd.DataFrame:
-    if forecast_df.empty:
-        return pd.DataFrame(
-            columns=[
-                RESERVOIR_COL,
-                CITY_COL,
-                "as_of_date",
-                "min_forecast_date",
-                "predicted_min_rate",
-                "lower_bound_at_min",
-                "stage_code",
-                "stage_label",
-                "stage_basis",
-                "stage_basis_value",
-                "normal_rate_at_min",
-                "normal_ratio_at_min",
-                "threshold_description",
-                "risk_code",
-                "risk_label",
-            ]
-        )
-
-    idx = forecast_df.groupby(RESERVOIR_COL)["predicted_rate"].idxmin()
-    summary = forecast_df.loc[idx].copy()
-    summary = summary.rename(
-        columns={
-            "forecast_date": "min_forecast_date",
-            "predicted_rate": "predicted_min_rate",
-            "lower_bound": "lower_bound_at_min",
-            "normal_rate": "normal_rate_at_min",
-            "normal_ratio": "normal_ratio_at_min",
-        }
-    )
     columns = [
         RESERVOIR_COL,
         CITY_COL,
@@ -310,7 +407,26 @@ def summarize_min_rates(forecast_df: pd.DataFrame) -> pd.DataFrame:
         "threshold_description",
         "risk_code",
         "risk_label",
+        "scenario_rainfall_multiplier",
+        "scenario_rainfall_sum_30d",
+        "scenario_temperature_delta",
+        "scenario_spi3_delta",
+        "scenario_spi6_delta",
     ]
+    if forecast_df.empty:
+        return pd.DataFrame(columns=columns)
+
+    idx = forecast_df.groupby(RESERVOIR_COL)["predicted_rate"].idxmin()
+    summary = forecast_df.loc[idx].copy()
+    summary = summary.rename(
+        columns={
+            "forecast_date": "min_forecast_date",
+            "predicted_rate": "predicted_min_rate",
+            "lower_bound": "lower_bound_at_min",
+            "normal_rate": "normal_rate_at_min",
+            "normal_ratio": "normal_ratio_at_min",
+        }
+    )
     return summary[[column for column in columns if column in summary.columns]].reset_index(drop=True)
 
 
@@ -319,6 +435,7 @@ def predict_seq2seq_min_rates(
     as_of_date: Optional[str | pd.Timestamp] = None,
     reservoir_names: Optional[Iterable[str]] = None,
     model_dir: Optional[Path | str] = None,
+    scenario: Optional[dict] = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     master_df = load_master_dataset(source=source)
     forecast_df = predict_seq2seq_forecasts(
@@ -326,6 +443,7 @@ def predict_seq2seq_min_rates(
         as_of_date=as_of_date,
         reservoir_names=reservoir_names,
         model_dir=model_dir,
+        scenario=scenario,
     )
     return forecast_df, summarize_min_rates(forecast_df)
 
@@ -337,6 +455,16 @@ if __name__ == "__main__":
         print(daily_forecasts.head(30).to_string(index=False))
         print("\n=== Seq2Seq min-rate summary ===")
         print(min_summary.to_string(index=False))
+
+        scenario = {
+            "rainfall_multiplier": 0.5,
+            "temperature_delta": 2.0,
+            "spi3_delta": -1.0,
+            "spi6_delta": -0.5,
+        }
+        _, scenario_summary = predict_seq2seq_min_rates(reservoir_names=["오봉"], scenario=scenario)
+        print("\n=== Scenario min-rate summary sample ===")
+        print(scenario_summary.to_string(index=False))
     except Exception as error:
         print("Seq2Seq 예측 실행에 실패했습니다.")
         print(error)

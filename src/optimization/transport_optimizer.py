@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import math
 import sys
 from pathlib import Path
 from typing import Optional
@@ -22,8 +21,6 @@ DEFAULT_TARGET_RATE = 50.0
 DEFAULT_SAFETY_RATE = 40.0
 DEFAULT_MAX_DISTANCE_KM = 100.0
 
-TRUCK_CAPACITY_1000M3 = 0.02
-COST_TRUCK_FIXED = 1_000.0
 PENALTY_UNMET = 1_000_000.0
 PENALTY_OUT_OF_REGION = 50.0
 
@@ -220,6 +217,29 @@ def build_candidate_supplies(
     return pd.DataFrame(rows)
 
 
+def _candidate_records(candidates_df: pd.DataFrame) -> list[dict]:
+    if candidates_df.empty:
+        return []
+    ordered = candidates_df.sort_values(["distance_km", "available_supply_1000m3"], ascending=[True, False])
+    records = []
+    for row in ordered.itertuples(index=False):
+        records.append(
+            {
+                "source_reservoir": row.source_reservoir,
+                "target_reservoir": row.target_reservoir,
+                "distance_km": round(float(row.distance_km), 3),
+                "available_supply_1000m3": round(float(row.available_supply_1000m3), 4),
+                "predicted_min_rate": round(float(row.predicted_min_rate), 4),
+                "stage_label": row.stage_label,
+                "stage_basis": row.stage_basis,
+                "normal_rate_at_min": None if pd.isna(row.normal_rate_at_min) else round(float(row.normal_rate_at_min), 4),
+                "normal_ratio_at_min": None if pd.isna(row.normal_ratio_at_min) else round(float(row.normal_ratio_at_min), 4),
+                "region": "강릉시" if row.시군 == "강릉시" else "타지역",
+            }
+        )
+    return records
+
+
 def optimize_water_transfer(
     obong_predicted_min_rate: float,
     candidate_predictions_df: pd.DataFrame,
@@ -249,10 +269,12 @@ def optimize_water_transfer(
             "status": "SAFE",
             "required_water_1000m3": 0.0,
             "total_supplied_1000m3": 0.0,
+            "total_available_supply_1000m3": 0.0,
             "feasible": True,
             "unmet_water_1000m3": 0.0,
             "candidate_count_100km": 0,
             "transfers": [],
+            "candidates": [],
         }
 
     candidates_df = build_candidate_supplies(
@@ -267,22 +289,23 @@ def optimize_water_transfer(
             "status": "DANGER",
             "required_water_1000m3": round(required_water, 4),
             "total_supplied_1000m3": 0.0,
+            "total_available_supply_1000m3": 0.0,
             "feasible": False,
             "unmet_water_1000m3": round(required_water, 4),
             "candidate_count_100km": 0,
             "transfers": [],
+            "candidates": [],
         }
 
     problem = LpProblem("ohbong_water_transfer", LpMinimize)
+    total_available_supply = float(candidates_df["available_supply_1000m3"].sum())
     sources = candidates_df["source_reservoir"].tolist()
     x = {source: LpVariable(f"x_{source}", lowBound=0) for source in sources}
-    trucks = {source: LpVariable(f"truck_{source}", lowBound=0, cat="Integer") for source in sources}
     unmet = LpVariable("unmet_water_1000m3", lowBound=0)
 
     problem += (
         lpSum(
             row.distance_km * x[row.source_reservoir]
-            + COST_TRUCK_FIXED * trucks[row.source_reservoir]
             + (PENALTY_OUT_OF_REGION * x[row.source_reservoir] if row.시군 != prefer_region else 0)
             for row in candidates_df.itertuples(index=False)
         )
@@ -291,7 +314,6 @@ def optimize_water_transfer(
     for row in candidates_df.itertuples(index=False):
         source = row.source_reservoir
         problem += x[source] <= row.available_supply_1000m3, f"supply_cap_{source}"
-        problem += x[source] <= TRUCK_CAPACITY_1000M3 * trucks[source], f"truck_cap_{source}"
     problem += lpSum(x[source] for source in sources) + unmet == required_water, "meet_demand"
     problem.solve(PULP_CBC_CMD(msg=0))
 
@@ -328,7 +350,6 @@ def optimize_water_transfer(
                 "remaining_rate_after_transfer": round(float(remaining_rate), 4),
                 "remaining_stage_code": remaining_stage["stage_code"],
                 "remaining_stage_label": remaining_stage["stage_label"],
-                "trucks": int(math.ceil(amount / TRUCK_CAPACITY_1000M3)),
                 "region": "강릉시" if row.시군 == prefer_region else "타지역",
             }
         )
@@ -338,10 +359,12 @@ def optimize_water_transfer(
         "status": "DANGER",
         "required_water_1000m3": round(required_water, 4),
         "total_supplied_1000m3": round(total_supplied, 4),
+        "total_available_supply_1000m3": round(total_available_supply, 4),
         "feasible": unmet_value <= 1e-6,
         "unmet_water_1000m3": round(unmet_value, 4),
         "candidate_count_100km": int(len(candidates_df)),
         "transfers": transfers,
+        "candidates": _candidate_records(candidates_df),
     }
 
 
