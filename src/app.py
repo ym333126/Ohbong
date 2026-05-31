@@ -1,4 +1,5 @@
 import sys
+from base64 import b64encode
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -66,6 +67,37 @@ STAGE_ICONS = {
     "경계": "🟠",
     "심각": "🔴",
 }
+
+
+def make_avatar_svg(background_color: str, icon: str) -> str:
+    if icon == "bot":
+        icon_markup = """
+        <rect x="18" y="23" width="28" height="22" rx="7" fill="none" stroke="white" stroke-width="4"/>
+        <circle cx="27" cy="34" r="2.8" fill="white"/>
+        <circle cx="37" cy="34" r="2.8" fill="white"/>
+        <path d="M26 42 H38" stroke="white" stroke-width="3" stroke-linecap="round"/>
+        <path d="M32 23 V16" stroke="white" stroke-width="4" stroke-linecap="round"/>
+        <circle cx="32" cy="13" r="3" fill="white"/>
+        """
+    else:
+        icon_markup = """
+        <circle cx="32" cy="30" r="14" fill="none" stroke="white" stroke-width="4"/>
+        <circle cx="27" cy="29" r="2.5" fill="white"/>
+        <circle cx="37" cy="29" r="2.5" fill="white"/>
+        <path d="M25 38 Q32 44 39 38" fill="none" stroke="white" stroke-width="3" stroke-linecap="round"/>
+        """
+    svg = f"""
+    <svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64">
+        <rect width="64" height="64" rx="16" fill="{background_color}"/>
+        {icon_markup}
+    </svg>
+    """
+    encoded = b64encode(svg.encode("utf-8")).decode("ascii")
+    return f"data:image/svg+xml;base64,{encoded}"
+
+
+CHATBOT_AVATAR = make_avatar_svg("#38bdf8", "bot")
+USER_AVATAR = make_avatar_svg("#84cc16", "user")
 
 HIDDEN_DISPLAY_COLUMNS = {"truck", "trucks", "remaining_stage_code"}
 CHAT_TABLE_CORE_COLUMNS = [
@@ -268,6 +300,29 @@ def render_project_card() -> None:
     render_drought_criteria_section()
 
 
+def render_chat_avatar_styles() -> None:
+    st.markdown(
+        """
+        <style>
+            div[data-testid="stChatMessageAvatarAssistant"] {
+                background-color: #38bdf8 !important;
+                color: #ffffff !important;
+            }
+            div[data-testid="stChatMessageAvatarUser"] {
+                background-color: #84cc16 !important;
+                color: #ffffff !important;
+            }
+            div[data-testid="stChatMessageAvatarAssistant"] svg,
+            div[data-testid="stChatMessageAvatarUser"] svg {
+                color: #ffffff !important;
+                fill: #ffffff !important;
+            }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
 def run_chatbot_message(message: str, settings: dict[str, Any]) -> dict[str, Any]:
     chatbot = st.session_state.get("chatbot")
     if chatbot is None:
@@ -381,7 +436,8 @@ def render_example_buttons(settings: dict[str, Any]) -> None:
 def render_chat() -> None:
     st.subheader("채팅")
     for message in st.session_state.messages:
-        with st.chat_message(message["role"]):
+        avatar = CHATBOT_AVATAR if message["role"] == "assistant" else USER_AVATAR
+        with st.chat_message(message["role"], avatar=avatar):
             if message.get("timestamp"):
                 st.caption(message["timestamp"])
             st.markdown(message["content"])
@@ -480,6 +536,7 @@ def main() -> None:
         return
     render_prediction_metrics()
     render_example_buttons(settings)
+    render_chat_avatar_styles()
     render_chat()
     user_message = st.chat_input("오봉 저수지 관측값, 예측, 운송 최적화를 질문해 보세요.")
     if user_message:
